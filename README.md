@@ -10,7 +10,7 @@ HeritagePod bridges modern lossless music collections and audiobooks directly to
 
 * **Lossless Audio Sync (FLAC $\rightarrow$ ALAC / AIFF):**
   * Point HeritagePod at any folder or network share (local drive or NAS/Samba).
-  * Automatically encodes FLAC into hardware-optimized Apple Lossless (`.m4a`) or uncompressed AIFF (`.aif`) on the fly.
+  * Automatically encodes FLAC into hardware-optimized Apple Lossless (`.m4a`) or uncompressed AIFF (`.aif`) on the fly **in RAM** to avoid duplicate files and IO churn.
   * Formats audio files with 4 KB atom alignment and `+faststart` moov-headers, preventing the notorious 5-second buffer crash on flash-modded (iFlash/CF) vintage iPods.
 
 * **Native Audiobooks with Position Bookmarking:**
@@ -79,20 +79,7 @@ HeritagePod also provides a full CLI interface for terminal workflows:
   ```bash
   python3 heritagepod.py eject
   ```
-
----
-
-## 🛠️ The Vintage Firmware Quirks HeritagePod Solves
-
-1. **The ~3.78 MB RAM Ceiling:**  
-   Early iPod firmware (especially 3rd Gen firmware 2.3) loads the entire binary `iTunesDB` into hardware RAM at boot. If the database exceeds ~3.78 MB, the iPod silently ignores the library and displays *0 Songs*. HeritagePod writes byte-precise, lean `mhbd`/`mhsd`/`mhlt`/`mhit` records matching vintage specifications.
-
-2. **The 5-Second Flash-Mod Crash:**  
-   When uncompressed or ALAC audio is synced without 4 KB chunk alignment on flash-mod adapters, the iPod's cache buffer underruns and crashes 5 seconds into playback. HeritagePod ensures atom alignment and `free` box padding so tracks play smoothly.
-
-3. **Master Playlist Indexing:**  
-   Vintage iPod firmware requires all tracks to reside in the Master Playlist (`is_master=1`) to be indexed into RAM. HeritagePod maintains the Master Playlist while writing custom user playlists as separate `mhyp` records under **Music $\rightarrow$ Playlists**.
-
+  
 ---
 
 ## 📄 License
