@@ -5,6 +5,8 @@
 HeritagePod bridges modern lossless music collections and audiobooks directly to vintage iPod hardware without iTunes, virtual machines, or bloated music players.
 
 ![Screenshot](HeritagePodScreenshot.png)
+
+Note: Currently only tested with a 3rd Gen.
 ---
 
 ## ✨ Features
