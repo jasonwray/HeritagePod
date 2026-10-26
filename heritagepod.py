@@ -545,7 +545,7 @@ def convert_flac_to_aiff(flac_path: Path, dest_aiff_path: Path, meta: dict) -> N
     if target_sr not in (44100, 48000):
         target_sr = 44100
 
-    shm_dir = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+    shm_dir = Path("/dev/shm") if (sys.platform != "win32" and Path("/dev/shm").is_dir()) else Path(tempfile.gettempdir())
     with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".aif", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
@@ -648,38 +648,49 @@ def _get_libalac():
 
     import ctypes
     here = Path(__file__).resolve().parent
-    so_path = here / "libalac.so"
+    ext = ".dll" if sys.platform == "win32" else (".dylib" if sys.platform == "darwin" else ".so")
+    so_path = here / f"libalac{ext}"
+    if not so_path.is_file():
+        so_path = here / "libalac.so"
     codec_dir = here / "alac_codec"
     bridge_cpp = here / "alac_c_bridge.cpp"
 
     if not so_path.is_file() and codec_dir.is_dir() and bridge_cpp.is_file() and shutil.which("g++"):
-        cmd = [
-            "g++", "-O3", "-fPIC", "-shared",
-            "-I", str(codec_dir),
-            str(bridge_cpp),
-            str(codec_dir / "EndianPortable.c"),
-            str(codec_dir / "ALACBitUtilities.c"),
-            str(codec_dir / "ALACEncoder.cpp"),
-            str(codec_dir / "ALACDecoder.cpp"),
-            str(codec_dir / "ag_enc.c"),
-            str(codec_dir / "ag_dec.c"),
-            str(codec_dir / "dp_enc.c"),
-            str(codec_dir / "dp_dec.c"),
-            str(codec_dir / "matrix_enc.c"),
-            str(codec_dir / "matrix_dec.c"),
-            "-o", str(so_path),
-        ]
-        subprocess.run(cmd, check=True)
+        try:
+            cmd = [
+                "g++", "-O3", "-fPIC", "-shared",
+                "-I", str(codec_dir),
+                str(bridge_cpp),
+                str(codec_dir / "EndianPortable.c"),
+                str(codec_dir / "ALACBitUtilities.c"),
+                str(codec_dir / "ALACEncoder.cpp"),
+                str(codec_dir / "ALACDecoder.cpp"),
+                str(codec_dir / "ag_enc.c"),
+                str(codec_dir / "ag_dec.c"),
+                str(codec_dir / "dp_enc.c"),
+                str(codec_dir / "dp_dec.c"),
+                str(codec_dir / "matrix_enc.c"),
+                str(codec_dir / "matrix_dec.c"),
+                "-o", str(so_path),
+            ]
+            subprocess.run(cmd, check=True)
+        except Exception:
+            pass
 
-    lib = ctypes.CDLL(str(so_path))
-    lib.alac_encode_pcm16.argtypes = [
-        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
-    ]
-    lib.alac_encode_pcm16.restype = ctypes.c_int32
-    _LIBALAC_HANDLE = lib
-    return lib
+    if so_path.is_file():
+        try:
+            lib = ctypes.CDLL(str(so_path))
+            lib.alac_encode_pcm16.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+            ]
+            lib.alac_encode_pcm16.restype = ctypes.c_int32
+            _LIBALAC_HANDLE = lib
+            return lib
+        except Exception:
+            pass
+    return None
 
 
 def _mp4_box(box_type: bytes, payload: bytes) -> bytes:
@@ -948,52 +959,73 @@ def convert_flac_to_alac(flac_path: Path, dest_m4a_path: Path, meta: dict) -> in
     """
     Convert a FLAC file to 16-bit, 44.1kHz (or 48kHz) stereo Apple Lossless (.m4a)
     compatible with 3rd Gen iPod Firmware 2.2/2.3.
+    Uses native libalac if available, with universal FFmpeg fallback.
     Returns the compressed bitrate in kbps.
     """
     target_sr = meta.get("sample_rate", 44100)
     if target_sr not in (44100, 48000):
         target_sr = 44100
 
-    shm_dir = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
-    with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".raw", delete=False) as raw_tmp:
-        raw_path = Path(raw_tmp.name)
+    if _get_libalac() is not None:
+        shm_dir = Path("/dev/shm") if (sys.platform != "win32" and Path("/dev/shm").is_dir()) else Path(tempfile.gettempdir())
+        with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".raw", delete=False) as raw_tmp:
+            raw_path = Path(raw_tmp.name)
 
-    try:
-        if shutil.which("gst-launch-1.0"):
-            cmd = [
-                "gst-launch-1.0", "-q",
-                "filesrc", f"location={flac_path}",
-                "!", "flacparse", "!", "flacdec",
-                "!", "audioconvert", "!", "audioresample",
-                "!", f"audio/x-raw,format=S16LE,channels=2,rate={target_sr}",
-                "!", "filesink", f"location={raw_path}",
-            ]
-            subprocess.run(cmd, check=True)
-        elif shutil.which("ffmpeg"):
-            cmd = [
-                "ffmpeg", "-y", "-v", "error",
-                "-i", str(flac_path),
-                "-f", "s16le", "-acodec", "pcm_s16le",
-                "-ar", str(target_sr), "-ac", "2",
-                str(raw_path),
-            ]
-            subprocess.run(cmd, check=True)
-        else:
-            raise RuntimeError("Neither gst-launch-1.0 nor ffmpeg found for FLAC decoding.")
+        try:
+            if shutil.which("gst-launch-1.0"):
+                cmd = [
+                    "gst-launch-1.0", "-q",
+                    "filesrc", f"location={flac_path}",
+                    "!", "flacparse", "!", "flacdec",
+                    "!", "audioconvert", "!", "audioresample",
+                    "!", f"audio/x-raw,format=S16LE,channels=2,rate={target_sr}",
+                    "!", "filesink", f"location={raw_path}",
+                ]
+                subprocess.run(cmd, check=True)
+            elif shutil.which("ffmpeg"):
+                cmd = [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-i", str(flac_path),
+                    "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ar", str(target_sr), "-ac", "2",
+                    str(raw_path),
+                ]
+                subprocess.run(cmd, check=True)
+            else:
+                raise RuntimeError("Neither gst-launch-1.0 nor ffmpeg found for FLAC decoding.")
 
-        pcm_bytes = raw_path.read_bytes()
-    finally:
-        raw_path.unlink(missing_ok=True)
+            pcm_bytes = raw_path.read_bytes()
+        finally:
+            raw_path.unlink(missing_ok=True)
 
-    with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".m4a", delete=False) as m4a_tmp:
-        tmp_m4a = Path(m4a_tmp.name)
-    try:
-        bitrate_kbps = _encode_s16le_pcm_to_alac_m4a(pcm_bytes, tmp_m4a, target_sr, meta)
-        dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(tmp_m4a, dest_m4a_path)
-        return bitrate_kbps
-    finally:
-        tmp_m4a.unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".m4a", delete=False) as m4a_tmp:
+            tmp_m4a = Path(m4a_tmp.name)
+        try:
+            bitrate_kbps = _encode_s16le_pcm_to_alac_m4a(pcm_bytes, tmp_m4a, target_sr, meta)
+            dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tmp_m4a, dest_m4a_path)
+            return bitrate_kbps
+        finally:
+            tmp_m4a.unlink(missing_ok=True)
+
+    # Universal cross-platform fallback via FFmpeg with +faststart
+    ff = find_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg binary not found. Please install ffmpeg to convert FLAC -> ALAC.")
+    dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ff, "-y", "-v", "error",
+        "-i", str(flac_path),
+        "-c:a", "alac",
+        "-ar", str(target_sr),
+        "-ac", "2",
+        "-movflags", "+faststart",
+        str(dest_m4a_path),
+    ]
+    subprocess.run(cmd, check=True)
+    size = dest_m4a_path.stat().st_size
+    dur_sec = meta.get("duration_ms", 1000) / 1000.0
+    return max(64, int((size * 8) / (dur_sec * 1000))) if dur_sec > 0 else 700
 
 
 def _extract_aiff_s16le_pcm(aiff_path: Path) -> Tuple[bytes, int]:
@@ -1070,25 +1102,46 @@ def _extract_aiff_s16le_pcm(aiff_path: Path) -> Tuple[bytes, int]:
 
 def convert_aiff_to_alac(aiff_path: Path, dest_m4a_path: Path, meta: dict) -> int:
     """
-    Convert an uncompressed AIFF (.aif/.aiff) file to 16-bit stereo Apple Lossless (.m4a)
-    using pure-Python AIFF parsing + native libalac.so encoding.
+    Convert an uncompressed AIFF (.aif/.aiff) file to 16-bit stereo Apple Lossless (.m4a).
+    Uses native libalac if available, with universal FFmpeg fallback.
     Returns the compressed bitrate in kbps.
     """
-    pcm_bytes, detected_sr = _extract_aiff_s16le_pcm(aiff_path)
-    target_sr = detected_sr if detected_sr in (44100, 48000) else meta.get("sample_rate", 44100)
+    target_sr = meta.get("sample_rate", 44100)
     if target_sr not in (44100, 48000):
         target_sr = 44100
 
-    shm_dir = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
-    with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".m4a", delete=False) as m4a_tmp:
-        tmp_m4a = Path(m4a_tmp.name)
-    try:
-        bitrate_kbps = _encode_s16le_pcm_to_alac_m4a(pcm_bytes, tmp_m4a, target_sr, meta)
-        dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(tmp_m4a, dest_m4a_path)
-        return bitrate_kbps
-    finally:
-        tmp_m4a.unlink(missing_ok=True)
+    if _get_libalac() is not None:
+        pcm_bytes, detected_sr = _extract_aiff_s16le_pcm(aiff_path)
+        if detected_sr in (44100, 48000):
+            target_sr = detected_sr
+        shm_dir = Path("/dev/shm") if (sys.platform != "win32" and Path("/dev/shm").is_dir()) else Path(tempfile.gettempdir())
+        with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".m4a", delete=False) as m4a_tmp:
+            tmp_m4a = Path(m4a_tmp.name)
+        try:
+            bitrate_kbps = _encode_s16le_pcm_to_alac_m4a(pcm_bytes, tmp_m4a, target_sr, meta)
+            dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tmp_m4a, dest_m4a_path)
+            return bitrate_kbps
+        finally:
+            tmp_m4a.unlink(missing_ok=True)
+
+    ff = find_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg binary not found. Please install ffmpeg to convert AIFF -> ALAC.")
+    dest_m4a_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ff, "-y", "-v", "error",
+        "-i", str(aiff_path),
+        "-c:a", "alac",
+        "-ar", str(target_sr),
+        "-ac", "2",
+        "-movflags", "+faststart",
+        str(dest_m4a_path),
+    ]
+    subprocess.run(cmd, check=True)
+    size = dest_m4a_path.stat().st_size
+    dur_sec = meta.get("duration_ms", 1000) / 1000.0
+    return max(64, int((size * 8) / (dur_sec * 1000))) if dur_sec > 0 else 700
 
 
 # =====================================================================
@@ -1099,28 +1152,63 @@ MARKER_MP3 = b"\x00MP3"
 
 
 def find_ffmpeg() -> Optional[str]:
-    """Locate ffmpeg binary (checks user local bin, current dir, and PATH)."""
-    local_ff = Path.home() / ".local" / "bin" / "ffmpeg"
-    if local_ff.is_file() and os.access(local_ff, os.X_OK):
-        return str(local_ff)
-    return shutil.which("ffmpeg")
+    """Locate ffmpeg binary across Linux, macOS, and Windows."""
+    # 1. System PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    if sys.platform == "win32":
+        found_win = shutil.which("ffmpeg.exe")
+        if found_win:
+            return found_win
+
+    # 2. Local bin / script directory / user home
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "ffmpeg",
+        script_dir / "ffmpeg.exe",
+        Path.home() / ".local" / "bin" / "ffmpeg",
+        Path.home() / "bin" / "ffmpeg",
+    ]
+
+    # macOS Homebrew / MacPorts
+    if sys.platform == "darwin":
+        candidates.extend([
+            Path("/opt/homebrew/bin/ffmpeg"),
+            Path("/usr/local/bin/ffmpeg"),
+            Path("/opt/local/bin/ffmpeg"),
+        ])
+    # Windows common install paths
+    elif sys.platform == "win32":
+        candidates.extend([
+            Path("C:/ffmpeg/bin/ffmpeg.exe"),
+            Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"),
+            Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe",
+            Path.home() / "scoop" / "shims" / "ffmpeg.exe",
+        ])
+
+    for cand in candidates:
+        if cand.is_file() and (sys.platform == "win32" or os.access(cand, os.X_OK)):
+            return str(cand)
+    return None
 
 
 def convert_audio_to_aac_m4b(
     src_file: Path,
     dest_file: Path,
     meta: dict,
-    bitrate_kbps: int = 128,
+    bitrate_kbps: int = 160,
 ) -> int:
     """
     Transcode an audio file (e.g. MP3) into an iPod-compatible AAC .m4b audiobook file
-    with +faststart, brand M4B, and metadata atoms.
+    with +faststart, brand M4B, disabled PNS/TNS (preventing high-frequency hardware decoder noise),
+    and metadata atoms.
     """
     ff = find_ffmpeg()
     if not ff:
         raise RuntimeError("ffmpeg binary not found. Please install ffmpeg to transcode to AAC .m4b.")
 
-    shm_dir = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+    shm_dir = Path("/dev/shm") if (sys.platform != "win32" and Path("/dev/shm").is_dir()) else Path(tempfile.gettempdir())
     with tempfile.NamedTemporaryFile(dir=shm_dir, suffix=".m4b", delete=False) as tmp_f:
         tmp_m4b = Path(tmp_f.name)
 
@@ -1132,6 +1220,10 @@ def convert_audio_to_aac_m4b(
             "-c:a", "aac",
             "-b:a", f"{bitrate_kbps}k",
             "-ar", "44100",
+            "-ac", "2",
+            "-aac_pns", "0",
+            "-aac_tns", "0",
+            "-cutoff", "18000",
             "-brand", "M4B ",
             "-movflags", "+faststart",
             "-metadata", f"title={meta.get('title', '')}",
@@ -1532,8 +1624,8 @@ class IPodLibrary:
         files_to_Import: List[Path] = []
         for raw_src in sources:
             raw_str = str(raw_src).strip()
-            # Convert smb://server/share/path URIs (copied from GNOME Files) to /run/user/$UID/gvfs/...
-            if raw_str.startswith("smb://"):
+            # Convert smb://server/share/path URIs to platform-native paths
+            if raw_str.startswith("smb://") and hasattr(os, "getuid"):
                 from urllib.parse import unquote, urlparse
                 parsed = urlparse(raw_str)
                 parts = [p for p in parsed.path.split("/") if p]
@@ -1542,6 +1634,10 @@ class IPodLibrary:
                     subpath = "/".join(unquote(p) for p in parts[1:])
                     gvfs_base = Path(f"/run/user/{os.getuid()}/gvfs/smb-share:server={parsed.hostname},share={share}")
                     raw_str = str(gvfs_base / subpath)
+            elif raw_str.startswith("smb://") and sys.platform == "win32":
+                from urllib.parse import unquote, urlparse
+                parsed = urlparse(raw_str)
+                raw_str = f"\\\\{parsed.hostname}{unquote(parsed.path).replace('/', chr(92))}"
             elif raw_str.startswith("file://"):
                 from urllib.parse import unquote, urlparse
                 raw_str = unquote(urlparse(raw_str).path)
@@ -2054,16 +2150,51 @@ def eject_ipod_device(mount_path: Path) -> Tuple[bool, str]:
     """
     Safely flush, unmount, and eject the iPod block device so the
     iPod display transitions from 'Do not disconnect' to 'OK to disconnect'.
+    Cross-platform support for Linux, macOS, and Windows.
     """
     p = Path(mount_path)
     if not p.is_dir():
         return False, f"Directory does not exist: {mount_path}"
 
-    try:
-        os.sync()
-    except Exception:
-        pass
+    if hasattr(os, "sync"):
+        try:
+            os.sync()
+        except Exception:
+            pass
 
+    # --- macOS (Darwin) ---
+    if sys.platform == "darwin":
+        try:
+            res = subprocess.run(["diskutil", "eject", str(p)], capture_output=True, text=True)
+            if res.returncode == 0:
+                return True, "iPod safely ejected via diskutil (OK to disconnect)."
+            res2 = subprocess.run(["diskutil", "unmountDisk", str(p)], capture_output=True, text=True)
+            if res2.returncode == 0:
+                return True, "iPod unmounted via diskutil (OK to disconnect)."
+            return False, f"diskutil error: {res.stderr.strip() or res2.stderr.strip()}"
+        except Exception as e:
+            return False, f"macOS eject failed: {e}"
+
+    # --- Windows (win32) ---
+    if sys.platform == "win32":
+        drive_letter = str(p.resolve())[:2].upper()
+        if len(drive_letter) == 2 and drive_letter[1] == ":":
+            ps_cmd = f'(New-Object -comObject Shell.Application).Namespace(17).ParseName("{drive_letter}").InvokeVerb("Eject")'
+            try:
+                res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, f"Drive {drive_letter} safely ejected (OK to disconnect)."
+            except Exception:
+                pass
+            try:
+                res = subprocess.run(["mountvol", f"{drive_letter}\\", "/P"], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, f"Drive {drive_letter} dismounted (OK to disconnect)."
+            except Exception:
+                pass
+            return True, f"Buffers flushed on {drive_letter}. Safe to disconnect."
+
+    # --- Linux / Unix ---
     dev = None
     if shutil.which("findmnt"):
         try:
@@ -2128,8 +2259,34 @@ def eject_ipod_device(mount_path: Path) -> Tuple[bool, str]:
 
 
 def detect_mounted_ipods() -> List[Path]:
-    """Scan common Linux mount points (/media, /run/media, /mnt) for mounted iPods."""
+    """Scan platform-specific mount points for mounted iPods."""
     candidates: List[Path] = []
+
+    # macOS: check /Volumes/*
+    if sys.platform == "darwin":
+        volumes = Path("/Volumes")
+        if volumes.is_dir():
+            try:
+                for child in volumes.iterdir():
+                    if child.is_dir() and (child / "iPod_Control").exists():
+                        candidates.append(child)
+            except PermissionError:
+                pass
+        return candidates
+
+    # Windows: check drive letters C:\ through Z:\
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase[2:]:
+            root = Path(f"{letter}:\\")
+            try:
+                if root.is_dir() and (root / "iPod_Control").exists():
+                    candidates.append(root)
+            except (PermissionError, OSError):
+                continue
+        return candidates
+
+    # Linux / BSD
     user = os.environ.get("USER", "")
     search_roots = [
         Path(f"/run/media/{user}"),
@@ -2150,7 +2307,9 @@ def detect_mounted_ipods() -> List[Path]:
 
 
 def detect_gvfs_music_dir() -> Optional[Path]:
-    """Detect mounted GVFS SMB/network shares (e.g. /run/user/1000/gvfs/smb-share:.../Music)."""
+    """Detect mounted GVFS SMB/network shares (Linux only)."""
+    if not hasattr(os, "getuid"):
+        return None
     gvfs_root = Path(f"/run/user/{os.getuid()}/gvfs")
     if gvfs_root.is_dir():
         try:
@@ -2198,7 +2357,7 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
     sort_state = {"col": "artist", "reverse": False}
 
     def _pick_directory(title: str, initial_dir: Optional[str] = None) -> Optional[str]:
-        if shutil.which("zenity"):
+        if sys.platform.startswith("linux") and shutil.which("zenity"):
             cmd = ["zenity", "--file-selection", "--directory", f"--title={title}"]
             if initial_dir and Path(initial_dir).is_dir():
                 cmd.append(f"--filename={initial_dir.rstrip('/')}/")
@@ -3301,7 +3460,7 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         if not p or not Path(p).is_dir():
             messagebox.showerror("Error", "Please select a valid iPod mount directory first.")
             return
-        if shutil.which("zenity"):
+        if sys.platform.startswith("linux") and shutil.which("zenity"):
             default_music = str(Path(p) / "Music") if (Path(p) / "Music").is_dir() else str(Path.home())
             cmd = [
                 "zenity", "--file-selection", "--multiple", "--separator=\n",
