@@ -6,7 +6,7 @@ HeritagePod bridges modern lossless music collections and audiobooks directly to
 
 ![Screenshot](HeritagePodScreenshot.png)
 
-Note: Currently only tested with a 3rd Gen.
+Note: Currently only tested with a 3rd Gen and Linux.
 ---
 
 ## ✨ Features
