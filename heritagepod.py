@@ -1615,6 +1615,8 @@ class IPodLibrary:
         copy native files, and update iTunesDB.
         Returns (added_count, skipped_count).
         """
+        if progress_cb:
+            progress_cb(0, 0, "Checking iPod structure & loading manifest...")
         self.ensure_structure()
         self.load_manifest()
         flac_format = (flac_format or "alac").strip().lower()
@@ -1653,20 +1655,39 @@ class IPodLibrary:
             except Exception:
                 pass
 
+            src_display = src.name or str(src)
+            if progress_cb:
+                progress_cb(0, 0, f"Scanning '{src_display}' for audio files...")
+
             if src.is_file() and src.suffix.lower() in SUPPORTED_EXTENSIONS:
                 files_to_Import.append(src)
             elif src.is_dir():
+                found_in_src = 0
                 for root_dir, _, filenames in os.walk(src, followlinks=True):
                     for fn in sorted(filenames):
                         p = Path(root_dir) / fn
                         if p.suffix.lower() in SUPPORTED_EXTENSIONS and not fn.startswith("._"):
                             files_to_Import.append(p)
+                            found_in_src += 1
+                            if progress_cb and (found_in_src % 25 == 0 or found_in_src == 1):
+                                progress_cb(0, 0, f"Scanning '{src_display}'... found {len(files_to_Import)} audio files")
 
         added = 0
         skipped = 0
         total = len(files_to_Import)
 
+        if total == 0:
+            if progress_cb:
+                progress_cb(0, 0, "No supported audio files found to import.")
+            return 0, 0
+
+        if progress_cb:
+            progress_cb(0, total, f"Found {total} audio file(s). Checking for duplicates...")
+
         for idx, src_file in enumerate(files_to_Import, start=1):
+            if progress_cb and (idx == 1 or idx % 10 == 0 or idx == total):
+                progress_cb(idx, total, f"Checking for duplicates: {src_file.name}")
+
             # Compute fast fingerprint (filename + size + mtime + first 64KB)
             st = src_file.stat()
             h = hashlib.sha1()
@@ -1677,8 +1698,8 @@ class IPodLibrary:
 
             if fingerprint in existing_hashes:
                 skipped += 1
-                if progress_cb:
-                    progress_cb(idx, total, f"Skipped duplicate: {src_file.name}")
+                if progress_cb and (skipped == 1 or skipped % 10 == 0 or idx == total):
+                    progress_cb(idx, total, f"Skipped duplicate ({skipped} skipped): {src_file.name}")
                 continue
 
             ext = src_file.suffix.lower()
@@ -2418,6 +2439,12 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         if not s:
             messagebox.showerror("Error", "Please enter or paste a folder/file path to sync.")
             return
+        expanded = Path(os.path.expanduser(s))
+        if not s.startswith("smb://") and not s.startswith("file://") and not expanded.exists():
+            messagebox.showerror("Path Not Found", f"The specified path does not exist:\n\n{s}")
+            return
+        status_var.set(f"Connecting to source path '{s}'...")
+        show_progress()
         _run_sync([Path(s)])
 
     ttk.Button(src_frame, text="Sync Path", command=sync_typed_path).pack(side=tk.LEFT, padx=2)
@@ -2556,10 +2583,44 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         command=lambda: delete_selected_tracks(),
     ).pack(side=tk.RIGHT, padx=(6, 0))
 
-    # --- Row 6: Status Bar ---
+    # --- Row 6: Status Bar & Progress Indicator ---
+    status_frame = ttk.Frame(root)
+    status_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+    progress_bar = ttk.Progressbar(status_frame, orient=tk.HORIZONTAL, length=220)
+
     status_var = tk.StringVar(value="Ready. Double-click any track (or select multiple tracks) to edit tags, or press Delete to remove.")
-    status_bar = ttk.Label(root, textvariable=status_var, padding=(12, 4, 12, 8), relief=tk.SUNKEN, anchor=tk.W)
-    status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+    status_bar = ttk.Label(status_frame, textvariable=status_var, padding=(12, 4, 12, 8), relief=tk.SUNKEN, anchor=tk.W)
+    status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def show_progress():
+        if not progress_bar.winfo_ismapped():
+            progress_bar.pack(side=tk.RIGHT, padx=(4, 8), pady=2, before=status_bar)
+            progress_bar.config(mode="indeterminate")
+            progress_bar.start(10)
+        root.config(cursor="watch")
+        root.update_idletasks()
+
+    def hide_progress():
+        progress_bar.stop()
+        if progress_bar.winfo_ismapped():
+            progress_bar.pack_forget()
+        root.config(cursor="")
+        root.update_idletasks()
+
+    def update_progress(idx: int, total: int, msg: str):
+        if total > 0:
+            if str(progress_bar["mode"]) != "determinate":
+                progress_bar.stop()
+                progress_bar.config(mode="determinate", maximum=total)
+            progress_bar["value"] = idx
+            status_var.set(f"[{idx}/{total}] {msg}")
+        else:
+            if str(progress_bar["mode"]) != "indeterminate":
+                progress_bar.config(mode="indeterminate")
+                progress_bar.start(10)
+            status_var.set(msg)
+        root.update_idletasks()
 
     # --- Helper Functions for Filtering, Sorting, Selection ---
     def _sort_key_for_col(t: TrackMetadata, col: str):
@@ -2782,13 +2843,17 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
             if not sel:
                 messagebox.showinfo("No Untagged Tracks", "No tracks with 'Unknown Artist' or 'Unknown Album' found.")
                 return
-        lib = IPodLibrary(Path(p))
-        def cb(idx, total, msg):
-            status_var.set(f"[{idx}/{total}] {msg}")
-            root.update_idletasks()
-        updated = lib.re_read_tags_from_files(set(sel), progress_cb=cb)
-        reload_from_disk()
-        status_var.set(f"Refreshed embedded tags on {updated} track(s) and updated iTunesDB!")
+        show_progress()
+        try:
+            lib = IPodLibrary(Path(p))
+            updated = lib.re_read_tags_from_files(set(sel), progress_cb=update_progress)
+            reload_from_disk()
+            status_var.set(f"Refreshed embedded tags on {updated} track(s) and updated iTunesDB!")
+        except Exception as e:
+            status_var.set(f"Tag error: {e}")
+            messagebox.showerror("Tag Error", f"An error occurred while reading tags:\n\n{e}")
+        finally:
+            hide_progress()
 
     # --- Convert Existing AIFF Tracks on iPod to ALAC (.m4a) ---
     def convert_selected_aiff_to_alac():
@@ -2819,16 +2884,20 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         )
         if not confirm:
             return
-        lib = IPodLibrary(Path(p))
-        def cb(idx, total, msg):
-            status_var.set(f"[{idx}/{total}] {msg}")
-            root.update_idletasks()
-        converted, saved_bytes = lib.convert_aiff_tracks_to_alac(set(aiff_rels), progress_cb=cb)
-        reload_from_disk()
-        saved_mb = saved_bytes / (1024 * 1024)
-        status_var.set(
-            f"Converted {converted} AIFF track(s) to ALAC (.m4a) — saved {saved_mb:.1f} MB! iTunesDB updated."
-        )
+        show_progress()
+        try:
+            lib = IPodLibrary(Path(p))
+            converted, saved_bytes = lib.convert_aiff_tracks_to_alac(set(aiff_rels), progress_cb=update_progress)
+            reload_from_disk()
+            saved_mb = saved_bytes / (1024 * 1024)
+            status_var.set(
+                f"Converted {converted} AIFF track(s) to ALAC (.m4a) — saved {saved_mb:.1f} MB! iTunesDB updated."
+            )
+        except Exception as e:
+            status_var.set(f"Conversion error: {e}")
+            messagebox.showerror("Conversion Error", f"An error occurred converting AIFF to ALAC:\n\n{e}")
+        finally:
+            hide_progress()
 
     # --- Transcode MP3 Audiobooks to AAC (.m4b) ---
     def convert_selected_audiobooks_to_m4b():
@@ -2860,16 +2929,20 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         )
         if not confirm:
             return
-        lib = IPodLibrary(Path(p))
-        def cb(idx, total, msg):
-            status_var.set(f"[{idx}/{total}] {msg}")
-            root.update_idletasks()
-        converted, bytes_saved = lib.convert_audiobook_tracks_to_m4b(set(targets), progress_cb=cb)
-        reload_from_disk()
-        saved_mb = bytes_saved / (1024 * 1024)
-        status_var.set(
-            f"Transcoded {converted} audiobook(s) to AAC (.m4b) — saved {saved_mb:.1f} MB! Ready in Audiobooks menu."
-        )
+        show_progress()
+        try:
+            lib = IPodLibrary(Path(p))
+            converted, bytes_saved = lib.convert_audiobook_tracks_to_m4b(set(targets), progress_cb=update_progress)
+            reload_from_disk()
+            saved_mb = bytes_saved / (1024 * 1024)
+            status_var.set(
+                f"Transcoded {converted} audiobook(s) to AAC (.m4b) — saved {saved_mb:.1f} MB! Ready in Audiobooks menu."
+            )
+        except Exception as e:
+            status_var.set(f"Transcoding error: {e}")
+            messagebox.showerror("Transcoding Error", f"An error occurred transcoding audiobooks:\n\n{e}")
+        finally:
+            hide_progress()
 
     # --- Single & Batch/Album Metadata Editor Modal ---
     KEEP_SENTINEL = "<Keep Individual Values>"
@@ -3482,14 +3555,24 @@ def launch_gui(initial_ipod: Optional[Path] = None) -> None:
         _run_sync([Path(f) for f in files])
 
     def _run_sync(paths: List[Path]):
-        lib = IPodLibrary(Path(ipod_var.get().strip()))
-        def cb(idx, total, msg):
-            status_var.set(f"[{idx}/{total}] {msg}")
-            root.update_idletasks()
-        target_fmt = "aiff" if "AIFF" in flac_target_var.get() else "alac"
-        added, skipped = lib.add_paths(paths, progress_cb=cb, flac_format=target_fmt)
-        reload_from_disk()
-        status_var.set(f"Done! Added {added} tracks ({skipped} duplicates skipped). Safe to eject iPod.")
+        p = ipod_var.get().strip()
+        if not p or not Path(p).is_dir():
+            messagebox.showerror("Error", "Please select a valid iPod mount directory first.")
+            return
+        show_progress()
+        status_var.set("Connecting to iPod & scanning source paths...")
+        root.update_idletasks()
+        try:
+            lib = IPodLibrary(Path(p))
+            target_fmt = "aiff" if "AIFF" in flac_target_var.get() else "alac"
+            added, skipped = lib.add_paths(paths, progress_cb=update_progress, flac_format=target_fmt)
+            reload_from_disk()
+            status_var.set(f"Done! Added {added} tracks ({skipped} duplicates skipped). Safe to eject iPod.")
+        except Exception as e:
+            status_var.set(f"Sync error: {e}")
+            messagebox.showerror("Sync Error", f"An error occurred during sync:\n\n{e}")
+        finally:
+            hide_progress()
 
     def rebuild_db_now():
         p = ipod_var.get().strip()
@@ -3590,20 +3673,29 @@ def main() -> None:
 
     if args.cmd == "add":
         def cli_progress(idx: int, total: int, msg: str):
-            print(f"[{idx}/{total}] {msg}")
+            if total > 0:
+                print(f"[{idx}/{total}] {msg}")
+            else:
+                print(f"[*] {msg}")
         added, skipped = lib.add_paths(args.sources, progress_cb=cli_progress, flac_format=args.flac_format)
         print(f"\nSuccess: {added} track(s) synced to {ipod_path}, {skipped} skipped.")
         print(f"Updated database: {lib.db_path} ({len(lib.tracks)} total tracks)")
     elif args.cmd == "convert-alac":
         def cli_progress(idx: int, total: int, msg: str):
-            print(f"[{idx}/{total}] {msg}")
+            if total > 0:
+                print(f"[{idx}/{total}] {msg}")
+            else:
+                print(f"[*] {msg}")
         converted, saved_bytes = lib.convert_aiff_tracks_to_alac(progress_cb=cli_progress)
         print(
             f"\nSuccess: Converted {converted} AIFF track(s) to ALAC (.m4a) — saved {saved_bytes / (1024 * 1024):.1f} MB."
         )
     elif args.cmd == "convert-audiobook":
         def cli_progress(idx: int, total: int, msg: str):
-            print(f"[{idx}/{total}] {msg}")
+            if total > 0:
+                print(f"[{idx}/{total}] {msg}")
+            else:
+                print(f"[*] {msg}")
         converted, saved_bytes = lib.convert_audiobook_tracks_to_m4b(progress_cb=cli_progress)
         print(
             f"\nSuccess: Transcoded {converted} audiobook(s) to AAC (.m4b) — saved {saved_bytes / (1024 * 1024):.1f} MB. Ready in native Audiobooks menu!"
